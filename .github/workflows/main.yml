@@ -704,7 +704,7 @@ jobs:
               Write-Warning "Failed to trigger dispatch event: $($_.Exception.Message)"
           }
 
-          $totalSeconds   = 9000
+          $totalSeconds   = 7200
           $elapsedSeconds = 0
           $heartbeatPath  = "C:\Cloud\login.heartbeat"
 
