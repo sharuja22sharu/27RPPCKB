@@ -18,7 +18,7 @@ on:
 jobs:
   RDP:
     runs-on: ubuntu-latest
-    timeout-minutes: 250
+    timeout-minutes: 150
 
     steps:
       - name: Add Tailscale Repository & Install Dependencies
