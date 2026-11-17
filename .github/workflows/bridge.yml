@@ -1,0 +1,217 @@
+name: RDP Bridge
+
+on:
+  repository_dispatch:
+    types: [RDP]
+  workflow_dispatch:
+    inputs:
+      ip:
+        description: 'Target Tailscale IP'
+        required: true
+      username:
+        description: 'Target Windows Username'
+        required: false
+      password:
+        description: 'Target Windows Password'
+        required: false
+
+jobs:
+  RDP:
+    runs-on: ubuntu-latest
+    timeout-minutes: 250
+
+    steps:
+      - name: Add Tailscale Repository & Install Dependencies
+        run: |
+          set -euo pipefail
+
+          echo "::group::Add Tailscale GPG Key & Repo"
+          # 1. Add Tailscale GPG Key & Repo
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+          echo "::endgroup::"
+
+          # --- Helpers -------------------------------------------------------
+          retry_update() {
+            for i in 1 2 3 4 5; do
+              if sudo apt-get update -o Acquire::Retries=5; then
+                return 0
+              fi
+              echo "apt-get update failed (attempt $i/5). Retrying in $((i*10))s..."
+              sleep $((i*10))
+            done
+            return 1
+          }
+
+          install_with_retry() {
+            local pkg="$1"
+            for i in 1 2 3; do
+              if sudo apt-get install -y "$pkg"; then
+                return 0
+              fi
+              echo "Install of '$pkg' failed (attempt $i/3). Retrying in $((i*10))s..."
+              sleep $((i*10))
+              sudo apt-get install -f -y || true
+              sudo apt-get update -o Acquire::Retries=5 || true
+            done
+            return 1
+          }
+
+          # --- apt-get update with retries ----------------------------------
+          echo "::group::apt-get update (with retries)"
+          if ! retry_update; then
+            echo "::error::apt-get update failed after 5 attempts"
+            exit 1
+          fi
+          echo "::endgroup::"
+
+          # --- Install base dependencies ------------------------------------
+          echo "::group::Install Tailscale / Xvfb / PulseAudio"
+          for pkg in tailscale xvfb pulseaudio alsa-utils libasound2-plugins; do
+            echo "Installing $pkg..."
+            if ! install_with_retry "$pkg"; then
+              echo "::error::Failed to install $pkg after 3 attempts"
+              exit 1
+            fi
+          done
+          echo "::endgroup::"
+
+          # --- Install FreeRDP (with fallback package names) ----------------
+          echo "::group::Install FreeRDP (with fallback package names)"
+          FREERDP_OK=0
+          for pkg in freerdp2-x11 freerdp3-x11 freerdp-x11; do
+            if apt-cache show "$pkg" >/dev/null 2>&1; then
+              echo "Found candidate FreeRDP package: $pkg"
+              if install_with_retry "$pkg"; then
+                echo "Successfully installed $pkg"
+                FREERDP_OK=1
+                break
+              fi
+            else
+              echo "Package $pkg not available in apt cache, trying next..."
+            fi
+          done
+
+          if [ "$FREERDP_OK" -ne 1 ]; then
+            echo "::warning::No known FreeRDP package found by name, searching apt-cache..."
+            CANDIDATE=$(apt-cache search --names-only 'freerdp.*x11' | awk '{print $1}' | head -n 1 || true)
+            if [ -n "$CANDIDATE" ] && install_with_retry "$CANDIDATE"; then
+              echo "Installed fallback package: $CANDIDATE"
+              FREERDP_OK=1
+            fi
+          fi
+
+          if [ "$FREERDP_OK" -ne 1 ]; then
+            echo "::error::Could not install any FreeRDP X11 package on this runner"
+            exit 1
+          fi
+          echo "::endgroup::"
+
+          # --- Ensure the 'xfreerdp' command actually exists ----------------
+          echo "::group::Ensure 'xfreerdp' command exists"
+          if ! command -v xfreerdp >/dev/null 2>&1; then
+            for bin in xfreerdp3 xfreerdp-2 xfreerdp-3; do
+              if command -v "$bin" >/dev/null 2>&1; then
+                echo "Symlinking $bin -> /usr/local/bin/xfreerdp"
+                sudo ln -sf "$(command -v "$bin")" /usr/local/bin/xfreerdp
+                break
+              fi
+            done
+          fi
+
+          if ! command -v xfreerdp >/dev/null 2>&1; then
+            echo "::error::xfreerdp binary still not available after install"
+            exit 1
+          fi
+          xfreerdp /version || true
+          echo "::endgroup::"
+
+      - name: Authenticate Tailscale
+        run: |
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
+                            --hostname=rdp-bridge-${{ github.run_id }} \
+                            --accept-routes
+          sleep 3
+          tailscale status || true
+
+      - name: Resolve IP & Credentials
+        run: |
+          TARGET_IP="${{ github.event.client_payload.ip || inputs.ip }}"
+          TARGET_USER="${{ github.event.client_payload.username || inputs.username || secrets.RDP_USER || 'Cloud PC' }}"
+          TARGET_PASS="${{ github.event.client_payload.password || inputs.password || secrets.RDP_PASSWORD || '123456' }}"
+
+          if [ -z "$TARGET_IP" ]; then
+            echo "::error::TARGET_IP is empty"
+            exit 1
+          fi
+
+          echo "TARGET_IP=$TARGET_IP"     >> $GITHUB_ENV
+          echo "TARGET_USER=$TARGET_USER" >> $GITHUB_ENV
+          echo "TARGET_PASS=$TARGET_PASS" >> $GITHUB_ENV
+
+          echo "::add-mask::$TARGET_PASS"
+          echo "::add-mask::$TARGET_USER"
+          echo "Resolved target: $TARGET_IP"
+
+      - name: Run Persistent RDP Session inside XVFB (with retry + keep-alive)
+        run: |
+          set +e   # <-- IMPORTANT: don't abort the job on transient failures
+
+          echo "Connecting headless RDP session to $TARGET_IP..."
+
+          # 1. Virtual X Server
+          Xvfb :99 -screen 0 1920x1080x24 &
+          XVFB_PID=$!
+          export DISPLAY=:99
+          sleep 2
+
+          # 2. PulseAudio
+          pulseaudio --start --exit-idle-time=-1 || true
+          sleep 1
+
+          MAX_ATTEMPTS=50          # ~50 * (10s run + 15s backoff) ≈ 20 min of retries
+          ATTEMPT=0
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT+1))
+            echo "=== RDP attempt $ATTEMPT/$MAX_ATTEMPTS -> $TARGET_IP ==="
+
+            # NOTE: only /cert:ignore (works on FreeRDP 2.x and 3.x)
+            #       /cert-ignore was removed in FreeRDP 3.x -> parse error
+            xfreerdp /v:"$TARGET_IP" \
+                     /u:"$TARGET_USER" \
+                     /p:"$TARGET_PASS" \
+                     /size:1920x1080 \
+                     /cert:ignore \
+                     /gfx \
+                     /network:auto \
+                     /sound:sys:pulse &
+            RDP_PID=$!
+            echo "xfreerdp launched, PID=$RDP_PID"
+
+            # Give it time to either die on parse error or actually connect
+            sleep 10
+
+            if kill -0 $RDP_PID 2>/dev/null; then
+              echo "RDP client survived startup, monitoring session..."
+              # Keep alive as long as it's running
+              while kill -0 $RDP_PID 2>/dev/null; do
+                echo "[$(date)] Bridge maintaining GUI+Audio session on $TARGET_IP..."
+                sleep 15
+              done
+              echo "RDP session ended."
+            else
+              echo "RDP client exited during startup (attempt $ATTEMPT)."
+              # Try to show any leftover diagnostic output
+              wait $RDP_PID
+              RC=$?
+              echo "xfreerdp exit code was: $RC"
+            fi
+
+            if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+              echo "Retrying in 15s..."
+              sleep 15
+            fi
+          done
+
+          echo "::warning::All $MAX_ATTEMPTS RDP attempts exhausted — job finishing."
